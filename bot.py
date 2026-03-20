@@ -216,28 +216,34 @@ async def ffmpeg_split(src: Path, out_dir: Path, n_parts: int,
             raise asyncio.CancelledError("Stopped by user")
 
         start    = i * seg_dur
-        # Output as .mp4 with -movflags +faststart
-        # faststart moves the moov atom to the START of the file so
-        # Telegram can stream/play it without downloading the whole file.
-        # Without faststart the moov atom is at the end → Telegram shows
-        # it as unplayable even though the video data is fine.
+        # Re-encode to H.264 + AAC — the ONLY format Telegram plays inline.
+        # Telegram refuses to play H.265/HEVC, VP9, AV1 — shows as broken file.
+        # -preset ultrafast = fastest encoding, ~10-15 min/GB on 2 vCPU.
+        # -crf 23 = good quality. -movflags +faststart = moov atom at start.
+        # -vf scale = keep original resolution but ensure even dimensions.
         out_path = out_dir / f"{src.stem}_part{i+1:03d}.mp4"
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-ss", str(start),
             "-i", str(src),
             "-t", str(seg_dur),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
             "-movflags", "+faststart",
+            "-avoid_negative_ts", "make_zero",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             str(out_path), "-y"
         ]
 
         await st.set(
             f"✂️ *Splitting* `{name}`\n\n"
             f"`{bar(i/n_parts)}` part {i+1}/{n_parts}\n"
-            f"{spin(i)} Cutting segment {i+1}...\n"
+            f"{spin(i)} Re-encoding to H.264 (part {i+1}/{n_parts})\n"
             f"Total: {since(t0)}\n\n"
+            f"_Re-encoding makes parts playable in Telegram_\n"
             f"_Send_ `stop` _to cancel_"
         )
         log.info(f"ffmpeg part {i+1}/{n_parts}: ss={start:.1f}s t={seg_dur:.1f}s → {out_path.name}")
@@ -548,7 +554,7 @@ async def process_file(msg: Message, bot, file_id: str, filename: str,
         suffix = Path(filename).suffix.lower()
         note   = ""
         if suffix in VIDEO_EXTS:
-            note = "\n_Parts are `.mkv` — playable in VLC, MX Player, etc._"
+            note = "\n_Parts re-encoded to H.264 MP4 — playable directly in Telegram_"
 
         await st.done(
             f"✅ *All done!*\n\n`{filename}`\n"
