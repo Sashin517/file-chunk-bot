@@ -216,15 +216,20 @@ async def ffmpeg_split(src: Path, out_dir: Path, n_parts: int,
             raise asyncio.CancelledError("Stopped by user")
 
         start    = i * seg_dur
-        # Always output as .mkv — guaranteed playable with stream copy
-        out_path = out_dir / f"{src.stem}_part{i+1:03d}.mkv"
+        # Output as .mp4 with -movflags +faststart
+        # faststart moves the moov atom to the START of the file so
+        # Telegram can stream/play it without downloading the whole file.
+        # Without faststart the moov atom is at the end → Telegram shows
+        # it as unplayable even though the video data is fine.
+        out_path = out_dir / f"{src.stem}_part{i+1:03d}.mp4"
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-ss", str(start),
             "-i", str(src),
             "-t", str(seg_dur),
-            "-c", "copy",           # stream copy — no re-encoding
+            "-c", "copy",
             "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
             str(out_path), "-y"
         ]
 
@@ -370,12 +375,15 @@ async def do_split(src: Path, n_parts: int, st: LiveStatus,
 
 # ── Upload ─────────────────────────────────────────────────────────────────────
 
+VIDEO_SEND_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m4v", ".wmv"}
+
 async def do_upload(msg: Message, path: Path, display_name: str,
                     caption: str, st: LiveStatus, prefix: str, t0: float):
-    size   = path.stat().st_size
-    ts     = time.time()
-    done   = asyncio.Event()
-    spin_i = 0
+    size      = path.stat().st_size
+    ts        = time.time()
+    done      = asyncio.Event()
+    spin_i    = 0
+    is_video  = path.suffix.lower() in VIDEO_SEND_EXTS
 
     async def watcher():
         nonlocal spin_i
@@ -392,15 +400,28 @@ async def do_upload(msg: Message, path: Path, display_name: str,
 
     wt = asyncio.create_task(watcher())
     try:
-        await msg.reply_document(
-            document=path,
-            filename=display_name,
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
-            read_timeout=READ_TIMEOUT,
-            write_timeout=WRITE_TIMEOUT,
-            connect_timeout=CONNECT_TIMEOUT,
-        )
+        if is_video:
+            # reply_video makes Telegram treat the file as a streamable video
+            # (shows play button, inline player, seek bar)
+            await msg.reply_video(
+                video=path,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN,
+                read_timeout=READ_TIMEOUT,
+                write_timeout=WRITE_TIMEOUT,
+                connect_timeout=CONNECT_TIMEOUT,
+                supports_streaming=True,
+            )
+        else:
+            await msg.reply_document(
+                document=path,
+                filename=display_name,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN,
+                read_timeout=READ_TIMEOUT,
+                write_timeout=WRITE_TIMEOUT,
+                connect_timeout=CONNECT_TIMEOUT,
+            )
     finally:
         done.set()
         wt.cancel()
