@@ -16,6 +16,7 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y \
     ffmpeg supervisor libssl3 zlib1g \
+    gcc python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/build/telegram-bot-api /usr/local/bin/telegram-bot-api
