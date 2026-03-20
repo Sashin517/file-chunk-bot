@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Telegram File Splitter Bot — binary split only, no ffmpeg hang
+Telegram File Splitter Bot
+- Uses local_mode=True so downloaded files are accessed directly from disk
+- No redundant network transfer — split straight from the Bot API server's path
+- Pure binary split, 4 MB buffer, no ffmpeg
 """
 
 import os
@@ -111,13 +114,19 @@ class LiveStatus:
             pass
 
 
-# ── Download ───────────────────────────────────────────────────────────────────
+# ── Get file path (local_mode skips network entirely) ──────────────────────────
 
-async def do_download(bot, file_id: str, dest: Path, total: int,
-                      st: LiveStatus, name: str, t0: float):
-    loop   = asyncio.get_running_loop()
-    done   = asyncio.Event()
+async def get_local_path(bot, file_id: str, filename: str,
+                          st: LiveStatus, name: str,
+                          file_size: int, t0: float) -> Path:
+    """
+    With local_mode=True the Bot API server already has the file on disk.
+    get_file() returns its local path. download_to_drive() just returns
+    that same path — no network transfer happens at all.
+    We show a spinner while waiting for get_file() to respond.
+    """
     spin_i = 0
+    done   = asyncio.Event()
 
     async def watcher():
         nonlocal spin_i
@@ -126,29 +135,35 @@ async def do_download(bot, file_id: str, dest: Path, total: int,
             if done.is_set():
                 break
             spin_i += 1
-            written = dest.stat().st_size if dest.exists() else 0
-            frac    = (written / total) if total > 0 else 0
-            speed   = written / max(time.time() - t0, 1)
-            eta     = int((total - written) / speed) if speed > 0 and total > written else 0
             await st.set(
-                f"⏬ *Downloading* `{name}`\n\n"
-                f"`{bar(frac)}` {frac*100:.0f}%\n"
-                f"{human_size(written)} / {human_size(total)}\n"
-                f"{spin(spin_i)} {human_size(int(speed))}/s   ETA: {eta}s\n"
+                f"⏬ *Getting file* `{name}`\n\n"
+                f"Size: {human_size(file_size)}\n"
+                f"{spin(spin_i)} Locating on server...\n"
                 f"Elapsed: {since(t0)}"
             )
 
     wt = asyncio.create_task(watcher())
     try:
-        tg_file = await bot.get_file(
-            file_id,
-            read_timeout=READ_TIMEOUT,
-            write_timeout=WRITE_TIMEOUT,
-        )
-        await loop.run_in_executor(
-            None,
-            lambda: asyncio.run(tg_file.download_to_drive(str(dest)))
-        )
+        tg_file   = await bot.get_file(file_id,
+                                        read_timeout=READ_TIMEOUT,
+                                        write_timeout=WRITE_TIMEOUT)
+        # In local_mode, file_path is the absolute path on the server disk
+        local_str = tg_file.file_path
+        log.info(f"Local file path from Bot API: {local_str}")
+
+        # file_path may be a file:// URI or plain path
+        if local_str and local_str.startswith("file://"):
+            local_path = Path(local_str[7:])
+        elif local_str and local_str.startswith("/"):
+            local_path = Path(local_str)
+        else:
+            # Fallback: download normally to our own dir
+            log.warning(f"Unexpected file_path format: {local_str!r}, downloading normally")
+            dest = DOWNLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{filename}"
+            await tg_file.download_to_drive(str(dest))
+            local_path = dest
+
+        return local_path
     finally:
         done.set()
         wt.cancel()
@@ -158,84 +173,23 @@ async def do_download(bot, file_id: str, dest: Path, total: int,
             pass
 
 
-# ── Split — pure binary, no ffmpeg ────────────────────────────────────────────
-#
-# Why not ffmpeg?
-# ffmpeg's segment muxer waits for keyframes and hangs on many real-world
-# MP4/MKV files indefinitely. Binary split always completes in seconds,
-# works on every file type, and the user just needs the bytes to reassemble.
-# To rejoin:  cat part000.mp4 part001.mp4 part002.mp4 > full.mp4
-#             (or use the /join command on desktop apps like HJSplit / 7-Zip)
+# ── Binary split — 4 MB buffer, never loads full file into RAM ─────────────────
 
-async def do_split(src: Path, chunk_mb: int, st: LiveStatus,
-                   name: str, dl_time: str, size: int, t0: float) -> list:
-    out_dir     = src.parent / "parts"
-    out_dir.mkdir(exist_ok=True)
-    chunk_bytes = chunk_mb * 1024 * 1024
-
-    done   = asyncio.Event()
-    spin_i = 0
-    ts     = time.time()
-
-    async def watcher():
-        nonlocal spin_i
-        while not done.is_set():
-            await asyncio.sleep(2)
-            if done.is_set():
-                break
-            spin_i += 1
-            n        = len(list(out_dir.glob("part*")))
-            written  = sum(f.stat().st_size for f in out_dir.glob("part*"))
-            frac     = written / size if size > 0 else 0
-            speed    = written / max(time.time() - ts, 1)
-            eta      = int((size - written) / speed) if speed > 0 and written < size else 0
-            await st.set(
-                f"✅ *Downloaded* in {dl_time}\n\n"
-                f"✂️ *Splitting* `{name}`\n"
-                f"`{bar(frac)}` {frac*100:.0f}%\n"
-                f"{spin(spin_i)} {human_size(written)} / {human_size(size)}\n"
-                f"Parts done: {n}   ETA: {eta}s\n"
-                f"Total: {since(t0)}"
-            )
-
-    wt = asyncio.create_task(watcher())
-    loop = asyncio.get_running_loop()
-
-    try:
-        parts = await loop.run_in_executor(
-            None, lambda: _binary_split(src, out_dir, chunk_bytes)
-        )
-    finally:
-        done.set()
-        wt.cancel()
-        try:
-            await wt
-        except asyncio.CancelledError:
-            pass
-
-    return parts
-
-
-def _binary_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
-    """
-    Split into chunk_bytes parts using a 4 MB read buffer.
-    Never loads more than 4 MB into RAM — safe on 1 GB Railway limit.
-    """
+def _binary_split(src: Path, out_dir: Path,
+                  chunk_bytes: int, stem: str, suffix: str) -> list:
     READ_BUF     = 4 * 1024 * 1024
     parts        = []
-    suffix       = src.suffix
     part_num     = 0
     part_written = 0
 
-    with open(src, "rb") as f:
-        part_path = out_dir / f"{src.stem}_part{part_num+1:03d}{suffix}"
-        out = open(part_path, "wb")
-        parts.append(part_path)
+    part_path = out_dir / f"{stem}_part{part_num+1:03d}{suffix}"
+    out       = open(part_path, "wb")
+    parts.append(part_path)
 
+    with open(src, "rb") as f:
         while True:
             to_read = min(READ_BUF, chunk_bytes - part_written)
             buf     = f.read(to_read)
-
             if not buf:
                 out.close()
                 if part_written == 0:
@@ -248,18 +202,70 @@ def _binary_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
 
             if part_written >= chunk_bytes:
                 out.close()
-                log.info(f"Split part {part_num+1}: {part_path.name} ({human_size(part_written)})")
+                log.info(f"Part {part_num+1}: {part_path.name} ({human_size(part_written)})")
                 part_num    += 1
                 part_written = 0
-                part_path    = out_dir / f"{src.stem}_part{part_num+1:03d}{suffix}"
+                part_path    = out_dir / f"{stem}_part{part_num+1:03d}{suffix}"
                 out          = open(part_path, "wb")
                 parts.append(part_path)
 
-        if not out.closed:
-            out.close()
-            log.info(f"Split part {part_num+1}: {part_path.name} ({human_size(part_written)})")
+    if not out.closed:
+        out.close()
+        if parts and parts[-1].exists() and part_written > 0:
+            log.info(f"Part {part_num+1}: {part_path.name} ({human_size(part_written)})")
 
     return parts
+
+
+async def do_split(src: Path, chunk_mb: int, st: LiveStatus,
+                   name: str, t0: float, size: int) -> list:
+    out_dir     = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    chunk_bytes = chunk_mb * 1024 * 1024
+    stem        = Path(name).stem
+    suffix      = Path(name).suffix or ".bin"
+
+    done   = asyncio.Event()
+    spin_i = 0
+    ts     = time.time()
+
+    async def watcher():
+        nonlocal spin_i
+        while not done.is_set():
+            await asyncio.sleep(2)
+            if done.is_set():
+                break
+            spin_i += 1
+            parts_done = list(out_dir.glob(f"{stem}_part*"))
+            n          = len(parts_done)
+            written    = sum(p.stat().st_size for p in parts_done)
+            frac       = written / size if size > 0 else 0
+            spd        = written / max(time.time() - ts, 1)
+            eta        = int((size - written) / spd) if spd > 0 and written < size else 0
+            await st.set(
+                f"✂️ *Splitting* `{name}`\n\n"
+                f"`{bar(frac)}` {frac*100:.0f}%\n"
+                f"{spin(spin_i)} {human_size(written)} / {human_size(size)}\n"
+                f"Parts done: {n}   ETA: {eta}s\n"
+                f"Total: {since(t0)}"
+            )
+
+    wt = asyncio.create_task(watcher())
+    loop = asyncio.get_running_loop()
+    try:
+        parts = await loop.run_in_executor(
+            None,
+            lambda: _binary_split(src, out_dir, chunk_bytes, stem, suffix)
+        )
+    finally:
+        done.set()
+        wt.cancel()
+        try:
+            await wt
+        except asyncio.CancelledError:
+            pass
+
+    return parts, out_dir
 
 
 # ── Upload ─────────────────────────────────────────────────────────────────────
@@ -310,10 +316,11 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 *File Splitter Bot*\n\n"
         "Forward any file — I'll split it into 500 MB parts and send them back.\n\n"
-        "To rejoin parts on your device:\n"
+        "To rejoin on your device:\n"
         "`cat file_part001.mp4 file_part002.mp4 > full.mp4`\n"
         "Or use HJSplit / 7-Zip on Windows.\n\n"
-        "Max: *2 GB*   Commands: /status /retry /clear",
+        "Max: *2 GB*\n"
+        "Commands: /status /retry /clear",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -347,7 +354,7 @@ async def cmd_retry(update: Update, _: ContextTypes.DEFAULT_TYPE):
         await do_upload(update.message, f, f.name, f"📦 {f.name}",
                         st, f"📦 Retry {i}/{len(files)}\n", t0)
         f.unlink(missing_ok=True)
-    for d in DOWNLOAD_DIR.glob("*/"):
+    for d in list(DOWNLOAD_DIR.glob("*/")):
         if d.is_dir() and not any(d.iterdir()):
             d.rmdir()
     await st.done(f"✅ Sent {len(files)} file(s) in {since(t0)}")
@@ -396,42 +403,43 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t0        = time.time()
     log.info(f"User {user.id} | '{filename}' | {human_size(file_size)}")
 
-    job_dir    = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
-    job_dir.mkdir(parents=True, exist_ok=True)
-    local_path = job_dir / filename
-
-    raw = await msg.reply_text("📥 Received — starting...")
+    raw = await msg.reply_text("📥 Received — locating file on server...")
     st  = LiveStatus(raw)
     await st.start(
-        f"⏬ *Downloading* `{filename}`\n\n"
-        f"`{'░'*16}` 0%\n"
+        f"⏬ *Locating* `{filename}`\n\n"
         f"Size: {human_size(file_size)}\n"
-        f"Server fetching file..."
+        f"Checking server storage..."
     )
 
+    parts_dir = None
+
     try:
-        await do_download(ctx.bot, tg_file.file_id, local_path,
-                          file_size, st, filename, t0)
+        # Get local path — no network transfer with local_mode
+        local_path = await get_local_path(
+            ctx.bot, tg_file.file_id, filename, st, filename, file_size, t0
+        )
 
         if not local_path.exists():
-            raise RuntimeError("Download finished but file missing on disk.")
+            raise RuntimeError(f"File not found at path: {local_path}")
 
         actual  = local_path.stat().st_size
-        dl_time = since(t0)
         thresh  = SPLIT_SIZE_MB * 1024 * 1024
-        log.info(f"Downloaded '{filename}' {human_size(actual)} in {dl_time}")
+        log.info(f"File ready at {local_path} — {human_size(actual)}")
+
+        await st.now(
+            f"✅ *File located* `{filename}`\n\n"
+            f"Size: {human_size(actual)}\n"
+            f"Elapsed: {since(t0)}\n\n"
+            + ("📤 Uploading..." if actual <= thresh
+               else f"✂️ Splitting into {SPLIT_SIZE_MB} MB parts...")
+        )
 
         # ── Small file: send directly ─────────────────────────────────────────
         if actual <= thresh:
-            await st.now(
-                f"✅ *Downloaded* in {dl_time}\n\n"
-                f"`{filename}` — {human_size(actual)}\n\n"
-                f"📤 Uploading..."
-            )
             await do_upload(
                 msg, local_path, filename,
                 f"📦 `{filename}`  |  {human_size(actual)}",
-                st, f"✅ *Downloaded* in {dl_time}\n\n", t0
+                st, f"✅ *File ready* — {human_size(actual)}\n\n", t0
             )
             await st.done(
                 f"✅ *Done!*\n\n"
@@ -441,25 +449,16 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         # ── Large file: split then send ───────────────────────────────────────
-        await st.now(
-            f"✅ *Downloaded* in {dl_time}\n\n"
-            f"`{filename}` — {human_size(actual)}\n\n"
-            f"✂️ Splitting into {SPLIT_SIZE_MB} MB parts..."
+        parts, parts_dir = await do_split(
+            local_path, SPLIT_SIZE_MB, st, filename, t0, actual
         )
-
-        parts  = await do_split(local_path, SPLIT_SIZE_MB, st,
-                                 filename, dl_time, actual, t0)
-        total  = len(parts)
+        total = len(parts)
         log.info(f"Split '{filename}' into {total} parts")
-
-        # original no longer needed
-        local_path.unlink(missing_ok=True)
 
         for i, part in enumerate(parts, 1):
             ps     = part.stat().st_size
             prefix = (
-                f"✅ *Downloaded* in {dl_time}\n"
-                f"✂️ *Split* — {total} parts\n\n"
+                f"✂️ *Split done* — {total} parts\n\n"
                 f"Part *{i}/{total}* — {human_size(ps)}\n"
             )
             await do_upload(
@@ -474,30 +473,30 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *All done!*\n\n"
             f"`{filename}`\n"
             f"{human_size(actual)} → {total} parts\n\n"
-            f"⬇ Download: {dl_time}\n"
-            f"⏱ Total:    {since(t0)}\n\n"
-            f"Rejoin: `cat {Path(filename).stem}_part*.{Path(filename).suffix[1:]} > full{Path(filename).suffix}`\n"
+            f"⏱ Total: {since(t0)}\n\n"
+            f"Rejoin: `cat {Path(filename).stem}_part*.mp4 > full.mp4`\n"
             f"Or use HJSplit on Windows 📶"
         )
 
     except TelegramError as e:
         log.exception("Telegram error")
-        kept = any(job_dir.rglob("*"))
+        kept = parts_dir and any(parts_dir.rglob("*"))
         await st.done(
             f"❌ *Telegram error*\n\n`{e}`\n\n"
-            + ("Files kept. /retry to resume." if kept
+            + ("Parts kept. /retry to resume." if kept
                else "Forward the file again.")
         )
     except Exception as e:
         log.exception("Error")
-        kept = any(job_dir.rglob("*"))
+        kept = parts_dir and any(parts_dir.rglob("*"))
         await st.done(
             f"❌ *Error*\n\n`{e}`\n\n"
-            + ("Files kept. /retry to resume." if kept
+            + ("Parts kept. /retry to resume." if kept
                else "Forward the file again.")
         )
     else:
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if parts_dir and parts_dir.exists():
+            shutil.rmtree(parts_dir, ignore_errors=True)
 
 
 # ── Catch-all ──────────────────────────────────────────────────────────────────
@@ -509,13 +508,12 @@ async def catch_all(update: Update, _: ContextTypes.DEFAULT_TYPE):
     log.warning(
         f"UNHANDLED from {update.effective_user.id}: "
         f"text={bool(msg.text)} doc={bool(msg.document)} "
-        f"video={bool(msg.video)} audio={bool(msg.audio)} "
-        f"photo={bool(msg.photo)}"
+        f"video={bool(msg.video)} audio={bool(msg.audio)}"
     )
     await msg.reply_text(
         "⚠️ Could not detect a file.\n\n"
-        f"doc=`{bool(msg.document)}` video=`{bool(msg.video)}` audio=`{bool(msg.audio)}`\n\n"
-        "Make sure you *forward* the file message directly.",
+        f"doc=`{bool(msg.document)}` video=`{bool(msg.video)}`\n\n"
+        "Make sure you *forward* the file directly.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -552,6 +550,7 @@ def main():
         .token(BOT_TOKEN)
         .base_url(f"{LOCAL_SERVER_URL}/bot")
         .base_file_url(f"{LOCAL_SERVER_URL}/file/bot")
+        .local_mode(True)           # tells PTB file_path is a local disk path
         .get_updates_request(request)
         .request(request)
         .build()
