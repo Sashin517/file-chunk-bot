@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram File Splitter Bot — clean rewrite
+Telegram File Splitter Bot
 """
 
 import os
 import asyncio
 import logging
-import subprocess
 import shutil
 import time
 import uuid
@@ -28,11 +27,11 @@ SPLIT_SIZE_MB    = int(os.environ.get("SPLIT_SIZE_MB", "490"))
 ALLOWED_IDS_RAW  = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_IDS      = set(int(x.strip()) for x in ALLOWED_IDS_RAW.split(",") if x.strip())
 
-# 10 min timeouts — large files need this
 READ_TIMEOUT    = 600
 WRITE_TIMEOUT   = 600
 CONNECT_TIMEOUT = 30
 POOL_TIMEOUT    = 60
+SPLIT_TIMEOUT   = 1800   # 30 min hard cap on ffmpeg
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -71,8 +70,6 @@ def spin(i: int) -> str:
 # ── LiveStatus ─────────────────────────────────────────────────────────────────
 
 class LiveStatus:
-    """Single Telegram message that edits itself every 2 s."""
-
     def __init__(self, msg: Message):
         self._msg     = msg
         self._text    = ""
@@ -83,19 +80,16 @@ class LiveStatus:
         self._text    = text
         self._running = True
         await self._push(text)
-        self._task    = asyncio.create_task(self._loop())
+        self._task = asyncio.create_task(self._loop())
 
     async def set(self, text: str):
-        """Queue new text — loop will push it within 2 s."""
         self._text = text
 
     async def now(self, text: str):
-        """Push immediately AND update queued text."""
         self._text = text
         await self._push(text)
 
     async def done(self, text: str):
-        """Stop loop and push final text."""
         self._running = False
         if self._task:
             self._task.cancel()
@@ -115,27 +109,15 @@ class LiveStatus:
         try:
             await self._msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
         except Exception:
-            pass   # ignore "message not modified" and flood waits silently
+            pass
 
 
 # ── Download ───────────────────────────────────────────────────────────────────
 
-async def do_download(
-    bot,
-    file_id: str,
-    dest: Path,
-    total: int,
-    st: LiveStatus,
-    name: str,
-    t0: float,
-):
-    """
-    Download file_id to dest.
-    The local Bot API server streams directly to dest so we CAN watch its size.
-    We run the actual download in a thread so the watcher coroutine stays alive.
-    """
-    loop = asyncio.get_running_loop()
-    done = asyncio.Event()
+async def do_download(bot, file_id: str, dest: Path, total: int,
+                      st: LiveStatus, name: str, t0: float):
+    loop   = asyncio.get_running_loop()
+    done   = asyncio.Event()
     spin_i = 0
 
     async def watcher():
@@ -153,14 +135,12 @@ async def do_download(
                 f"⏬ *Downloading* `{name}`\n\n"
                 f"`{bar(frac)}` {frac*100:.0f}%\n"
                 f"{human_size(written)} / {human_size(total)}\n"
-                f"{spin(spin_i)} Speed: {human_size(int(speed))}/s   "
-                f"ETA: {eta}s\n"
+                f"{spin(spin_i)} {human_size(int(speed))}/s   ETA: {eta}s\n"
                 f"Elapsed: {since(t0)}"
             )
 
     wt = asyncio.create_task(watcher())
     try:
-        # get_file + download run in a thread — doesn't block event loop
         tg_file = await bot.get_file(
             file_id,
             read_timeout=READ_TIMEOUT,
@@ -183,7 +163,11 @@ async def do_download(
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m4v"}
 
-def _ffmpeg_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
+async def _ffmpeg_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
+    """
+    Use asyncio.create_subprocess_exec so the process can actually be killed
+    if it hangs — unlike subprocess.run in an executor which cannot be cancelled.
+    """
     pattern = str(out_dir / f"part%03d{src.suffix}")
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -194,10 +178,30 @@ def _ffmpeg_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
         "-reset_timestamps", "1",
         pattern, "-y"
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {r.stderr[:300]}")
-    return sorted(out_dir.glob(f"part*{src.suffix}"))
+    log.info(f"ffmpeg: {' '.join(cmd)}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=SPLIT_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"ffmpeg timed out after {SPLIT_TIMEOUT}s")
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg error (code {proc.returncode}): {stderr.decode()[:300]}")
+
+    parts = sorted(out_dir.glob(f"part*{src.suffix}"))
+    if not parts:
+        raise RuntimeError("ffmpeg ran but produced no output files")
+    return parts
+
 
 def _binary_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
     parts = []
@@ -210,16 +214,10 @@ def _binary_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
             i += 1
     return parts
 
-async def do_split(
-    src: Path,
-    chunk_mb: int,
-    st: LiveStatus,
-    name: str,
-    dl_time: str,
-    size: int,
-    t0: float,
-) -> list:
-    out_dir = src.parent / "parts"
+
+async def do_split(src: Path, chunk_mb: int, st: LiveStatus,
+                   name: str, dl_time: str, size: int, t0: float) -> list:
+    out_dir     = src.parent / "parts"
     out_dir.mkdir(exist_ok=True)
     chunk_bytes = chunk_mb * 1024 * 1024
     suffix      = src.suffix.lower()
@@ -239,9 +237,9 @@ async def do_split(
             await st.set(
                 f"✅ *Downloaded* in {dl_time}\n\n"
                 f"✂️ *Splitting* `{name}`\n"
-                f"{spin(spin_i)} {human_size(size)} — lossless stream copy\n"
-                f"Parts ready: {n}   "
-                f"Elapsed: {since(ts)}"
+                f"{spin(spin_i)} {human_size(size)} — lossless copy\n"
+                f"Parts ready: {n}   Elapsed: {since(ts)}\n"
+                f"Total: {since(t0)}"
             )
 
     wt = asyncio.create_task(watcher())
@@ -249,11 +247,9 @@ async def do_split(
     try:
         if suffix in VIDEO_EXTS:
             try:
-                parts = await loop.run_in_executor(
-                    None, lambda: _ffmpeg_split(src, out_dir, chunk_bytes)
-                )
+                parts = await _ffmpeg_split(src, out_dir, chunk_bytes)
             except Exception as e:
-                log.warning(f"ffmpeg failed ({e}), falling back to binary split")
+                log.warning(f"ffmpeg failed ({e}), binary split fallback")
                 shutil.rmtree(out_dir, ignore_errors=True)
                 out_dir.mkdir()
                 parts = await loop.run_in_executor(
@@ -276,16 +272,8 @@ async def do_split(
 
 # ── Upload ─────────────────────────────────────────────────────────────────────
 
-async def do_upload(
-    msg: Message,
-    path: Path,
-    display_name: str,
-    caption: str,
-    st: LiveStatus,
-    prefix: str,
-    t0: float,
-):
-    """Upload one file back to user with live spinner."""
+async def do_upload(msg: Message, path: Path, display_name: str,
+                    caption: str, st: LiveStatus, prefix: str, t0: float):
     size   = path.stat().st_size
     ts     = time.time()
     done   = asyncio.Event()
@@ -300,8 +288,7 @@ async def do_upload(
                 await st.set(
                     f"{prefix}\n"
                     f"📤 *Uploading* `{display_name}`\n"
-                    f"{spin(spin_i)} {human_size(size)}   "
-                    f"uploading {since(ts)}\n"
+                    f"{spin(spin_i)} {human_size(size)}   {since(ts)}\n"
                     f"Total: {since(t0)}"
                 )
 
@@ -330,17 +317,16 @@ async def do_upload(
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 *File Splitter Bot*\n\n"
-        "Forward any file from any chat — I'll split it into 500 MB parts "
-        "and send them back one by one.\n\n"
-        "Max: *2 GB*   Commands: /status /retry /clear",
+        "Forward any file — I'll split it into 500 MB parts.\n\n"
+        "Max: *2 GB*\n"
+        "Commands: /status /retry /clear",
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-    files = list(DOWNLOAD_DIR.rglob("*"))
-    files = [f for f in files if f.is_file()]
+    files = [f for f in DOWNLOAD_DIR.rglob("*") if f.is_file()]
     if not files:
         await update.message.reply_text("📭 No files on server.")
         return
@@ -357,15 +343,15 @@ async def cmd_retry(update: Update, _: ContextTypes.DEFAULT_TYPE):
         return
     files = sorted([f for f in DOWNLOAD_DIR.rglob("*") if f.is_file()])
     if not files:
-        await update.message.reply_text("📭 No files waiting. Forward a file to start.")
+        await update.message.reply_text("📭 No files waiting.")
         return
     raw = await update.message.reply_text(f"📦 Sending {len(files)} file(s)...")
     st  = LiveStatus(raw)
     await st.start(f"📤 Sending *{len(files)}* file(s)...")
     t0  = time.time()
     for i, f in enumerate(files, 1):
-        prefix = f"📦 Retry {i}/{len(files)}\n"
-        await do_upload(update.message, f, f.name, f"📦 {f.name}", st, prefix, t0)
+        await do_upload(update.message, f, f.name, f"📦 {f.name}",
+                        st, f"📦 Retry {i}/{len(files)}\n", t0)
         f.unlink(missing_ok=True)
     for d in DOWNLOAD_DIR.glob("*/"):
         if d.is_dir() and not any(d.iterdir()):
@@ -388,9 +374,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not authorized.")
         return
 
-    msg = update.message
-
-    # Accept document OR video OR audio OR voice OR video_note
+    msg      = update.message
     tg_file  = None
     filename = "file"
 
@@ -411,7 +395,6 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         filename = f"videonote_{msg.video_note.file_id}.mp4"
 
     if tg_file is None:
-        # Should not reach here due to filter, but safety net
         await msg.reply_text("⚠️ Could not detect a file in this message.")
         return
 
@@ -419,8 +402,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t0        = time.time()
     log.info(f"User {user.id} | '{filename}' | {human_size(file_size)}")
 
-    # Use a unique work directory per job to avoid filename collisions
-    job_dir = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
+    job_dir    = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
     job_dir.mkdir(parents=True, exist_ok=True)
     local_path = job_dir / filename
 
@@ -434,59 +416,55 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # ── Download ──────────────────────────────────────────────────────────
-        await do_download(ctx.bot, tg_file.file_id, local_path, file_size, st, filename, t0)
+        await do_download(ctx.bot, tg_file.file_id, local_path,
+                          file_size, st, filename, t0)
 
         if not local_path.exists():
-            raise RuntimeError("Download completed but file not found on disk.")
+            raise RuntimeError("Download finished but file missing on disk.")
 
-        actual   = local_path.stat().st_size
-        dl_time  = since(t0)
-        log.info(f"Downloaded '{filename}' — {human_size(actual)} in {dl_time}")
+        actual  = local_path.stat().st_size
+        dl_time = since(t0)
+        thresh  = SPLIT_SIZE_MB * 1024 * 1024
+        log.info(f"Downloaded '{filename}' {human_size(actual)} in {dl_time}")
 
-        thresh = SPLIT_SIZE_MB * 1024 * 1024
-
-        # ── Small file: send as-is ────────────────────────────────────────────
         if actual <= thresh:
             await st.now(
                 f"✅ *Downloaded* in {dl_time}\n\n"
                 f"`{filename}` — {human_size(actual)}\n\n"
-                f"📤 Uploading to you..."
+                f"📤 Uploading..."
             )
             await do_upload(
                 msg, local_path, filename,
                 f"📦 `{filename}`  |  {human_size(actual)}",
-                st,
-                f"✅ *Downloaded* in {dl_time}\n\n",
-                t0
+                st, f"✅ *Downloaded* in {dl_time}\n\n", t0
             )
             await st.done(
                 f"✅ *Done!*\n\n"
                 f"`{filename}`\n"
-                f"{human_size(actual)} delivered in {since(t0)}"
+                f"{human_size(actual)} — {since(t0)}"
             )
             return
 
-        # ── Large file: split then send ───────────────────────────────────────
+        # Large file
         await st.now(
             f"✅ *Downloaded* in {dl_time}\n\n"
             f"`{filename}` — {human_size(actual)}\n\n"
             f"✂️ Splitting into {SPLIT_SIZE_MB} MB parts..."
         )
 
-        parts      = await do_split(local_path, SPLIT_SIZE_MB, st, filename, dl_time, actual, t0)
+        parts      = await do_split(local_path, SPLIT_SIZE_MB, st,
+                                     filename, dl_time, actual, t0)
         total      = len(parts)
         split_time = since(t0)
-        log.info(f"Split into {total} parts in {split_time}")
+        log.info(f"Split '{filename}' into {total} parts")
 
-        # Original no longer needed
         local_path.unlink(missing_ok=True)
 
         for i, part in enumerate(parts, 1):
             ps     = part.stat().st_size
             prefix = (
                 f"✅ *Downloaded* in {dl_time}\n"
-                f"✂️ *Split* done — {total} parts\n\n"
+                f"✂️ *Split* — {total} parts\n\n"
                 f"Part *{i}/{total}* — {human_size(ps)}\n"
             )
             await do_upload(
@@ -500,18 +478,25 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await st.done(
             f"✅ *All done!*\n\n"
             f"`{filename}`\n"
-            f"{human_size(actual)} → {total} × {SPLIT_SIZE_MB} MB parts\n\n"
-            f"⬇ Download:  {dl_time}\n"
-            f"⏱ Total:      {since(t0)}\n\n"
-            f"Download them one by one 📶"
+            f"{human_size(actual)} → {total} × {SPLIT_SIZE_MB} MB\n\n"
+            f"⬇ Download: {dl_time}\n"
+            f"⏱ Total:    {since(t0)}\n\n"
+            f"Download parts one by one 📶"
         )
 
+    except asyncio.TimeoutError:
+        log.error("ffmpeg timed out")
+        await st.done(
+            f"❌ *Split timed out*\n\n"
+            f"ffmpeg took too long and was killed.\n"
+            f"Send /status — parts already written may be sendable via /retry."
+        )
     except TelegramError as e:
         log.exception("Telegram error")
         kept = any(job_dir.rglob("*"))
         await st.done(
             f"❌ *Telegram error*\n\n`{e}`\n\n"
-            + ("Files kept on server.\nSend /retry to resume." if kept
+            + ("Files kept. Send /retry to resume." if kept
                else "Please forward the file again.")
         )
     except Exception as e:
@@ -519,15 +504,14 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kept = any(job_dir.rglob("*"))
         await st.done(
             f"❌ *Error*\n\n`{e}`\n\n"
-            + ("Files kept on server.\nSend /retry to resume." if kept
+            + ("Files kept. Send /retry to resume." if kept
                else "Please forward the file again.")
         )
     else:
-        # Only clean up on full success
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-# ── Catch-all debug handler ────────────────────────────────────────────────────
+# ── Catch-all ──────────────────────────────────────────────────────────────────
 
 async def catch_all(update: Update, _: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -537,13 +521,12 @@ async def catch_all(update: Update, _: ContextTypes.DEFAULT_TYPE):
         f"UNHANDLED from {update.effective_user.id}: "
         f"text={bool(msg.text)} doc={bool(msg.document)} "
         f"video={bool(msg.video)} audio={bool(msg.audio)} "
-        f"photo={bool(msg.photo)} sticker={bool(msg.sticker)}"
+        f"photo={bool(msg.photo)}"
     )
     await msg.reply_text(
-        "⚠️ I received your message but couldn't detect a file.\n\n"
-        f"*Type detected:* "
+        "⚠️ Could not detect a file.\n\n"
         f"doc={bool(msg.document)} video={bool(msg.video)} audio={bool(msg.audio)}\n\n"
-        "Make sure you *forward* the file message directly — don't copy it.",
+        "Make sure you *forward* the file directly.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -560,11 +543,11 @@ def wait_for_local_server(url: str, retries: int = 20, delay: float = 3.0):
         except Exception:
             log.info(f"Waiting for local server... ({i+1}/{retries})")
             time.sleep(delay)
-    log.warning("Local server not responding — starting bot anyway.")
+    log.warning("Local server not responding — starting anyway.")
 
 
 def main():
-    log.info(f"Using local Bot API server: {LOCAL_SERVER_URL}")
+    log.info(f"Using local Bot API: {LOCAL_SERVER_URL}")
     wait_for_local_server(LOCAL_SERVER_URL)
 
     request = HTTPXRequest(
@@ -586,11 +569,8 @@ def main():
     )
 
     file_filter = (
-        filters.Document.ALL
-        | filters.VIDEO
-        | filters.AUDIO
-        | filters.VOICE
-        | filters.VIDEO_NOTE
+        filters.Document.ALL | filters.VIDEO
+        | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
     )
 
     app.add_handler(CommandHandler("start",  cmd_start))
@@ -600,8 +580,7 @@ def main():
     app.add_handler(CommandHandler("clear",  cmd_clear))
     app.add_handler(MessageHandler(file_filter, handle_file))
     app.add_handler(MessageHandler(
-        filters.ALL & ~filters.COMMAND & ~file_filter,
-        catch_all
+        filters.ALL & ~filters.COMMAND & ~file_filter, catch_all
     ), group=1)
 
     log.info("Bot ready.")
