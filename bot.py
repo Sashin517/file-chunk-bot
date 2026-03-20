@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram File Splitter Bot — full featured
+Telegram File Splitter Bot
 - local_mode=True: file already on disk, no redundant download
-- ffmpeg time-based split for video (playable parts)
-- binary split fallback for non-video
-- user can choose number of parts
-- handles >2GB by processing in 2GB chunks sequentially
+- Video split: ffmpeg segment muxer → .mkv output (playable, no moov atom issue)
+- Non-video: binary split with 4MB buffer
+- Stop command: send "stop" to cancel current job
+- User chooses number of parts
+- Files >2GB handled in sequential 1.9GB super-chunks
 """
 
 import os
@@ -21,7 +22,7 @@ from telegram import Update, Message
 from telegram.ext import (
     ApplicationBuilder, MessageHandler,
     CommandHandler, ContextTypes, filters,
-    ConversationHandler, CallbackContext
+    ConversationHandler
 )
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -34,13 +35,12 @@ SPLIT_SIZE_MB    = int(os.environ.get("SPLIT_SIZE_MB", "490"))
 ALLOWED_IDS_RAW  = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_IDS      = set(int(x.strip()) for x in ALLOWED_IDS_RAW.split(",") if x.strip())
 
-MAX_TG_SIZE     = 2 * 1024 * 1024 * 1024   # 2 GB Telegram hard limit
+MAX_TG_BYTES    = 2 * 1024 * 1024 * 1024   # 2 GB Telegram hard limit
 READ_TIMEOUT    = 600
 WRITE_TIMEOUT   = 600
 CONNECT_TIMEOUT = 30
 POOL_TIMEOUT    = 60
 
-# Conversation state
 ASKING_PARTS = 1
 
 logging.basicConfig(
@@ -50,8 +50,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Per-user pending job storage  {user_id: {file_id, filename, file_size}}
-pending_jobs: dict = {}
+# Per-user state
+pending_jobs: dict = {}   # user_id → job dict
+stop_flags:   dict = {}   # user_id → asyncio.Event
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -78,6 +79,10 @@ def since(t: float) -> str:
 
 def spin(i: int) -> str:
     return "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[i % 10]
+
+def is_stopped(uid: int) -> bool:
+    ev = stop_flags.get(uid)
+    return ev is not None and ev.is_set()
 
 
 # ── LiveStatus ─────────────────────────────────────────────────────────────────
@@ -125,7 +130,7 @@ class LiveStatus:
             pass
 
 
-# ── Get local file path via local_mode ────────────────────────────────────────
+# ── Get local file path (local_mode) ──────────────────────────────────────────
 
 async def get_local_path(bot, file_id: str, filename: str,
                           st: LiveStatus, file_size: int, t0: float) -> Path:
@@ -159,8 +164,7 @@ async def get_local_path(bot, file_id: str, filename: str,
         elif local_str and local_str.startswith("/"):
             return Path(local_str)
         else:
-            # Fallback: actually download it
-            log.warning(f"Unexpected file_path: {local_str!r} — downloading")
+            log.warning(f"Non-local path: {local_str!r} — downloading")
             dest = DOWNLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{filename}"
             await tg_file.download_to_drive(str(dest))
             return dest
@@ -173,10 +177,11 @@ async def get_local_path(bot, file_id: str, filename: str,
             pass
 
 
-# ── Video duration via ffprobe ─────────────────────────────────────────────────
+# ── Video split: ffmpeg → MKV (always playable) ───────────────────────────────
+
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m4v", ".wmv"}
 
 async def get_duration(path: Path) -> float | None:
-    """Return video duration in seconds, or None if not a video / ffprobe fails."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
@@ -194,41 +199,43 @@ async def get_duration(path: Path) -> float | None:
         return None
 
 
-# ── Video split via ffmpeg time-based (produces playable parts) ───────────────
-
-async def ffmpeg_time_split(src: Path, out_dir: Path, n_parts: int,
-                             duration: float, st: LiveStatus,
-                             name: str, t0: float) -> list:
+async def ffmpeg_split(src: Path, out_dir: Path, n_parts: int,
+                        duration: float, st: LiveStatus,
+                        name: str, t0: float, uid: int) -> list:
     """
-    Split video into n_parts equal time segments using ffmpeg -ss/-t.
-    Each part is a self-contained playable video file.
-    Uses stream copy (no re-encoding) — fast and lossless quality.
-    Each segment is a separate ffmpeg call so we can track progress
-    and kill individual stuck processes.
+    Split video into n_parts using ffmpeg segment muxer → .mkv
+    MKV does not require a moov atom — every segment is self-contained
+    and playable. Uses stream copy (no re-encoding = fast, lossless).
+    Each part is a separate ffmpeg call so we can track + kill individually.
     """
     seg_dur = duration / n_parts
-    suffix  = src.suffix
     parts   = []
 
     for i in range(n_parts):
+        if is_stopped(uid):
+            raise asyncio.CancelledError("Stopped by user")
+
         start    = i * seg_dur
-        out_path = out_dir / f"{src.stem}_part{i+1:03d}{suffix}"
+        # Always output as .mkv — guaranteed playable with stream copy
+        out_path = out_dir / f"{src.stem}_part{i+1:03d}.mkv"
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-ss", str(start),
             "-i", str(src),
             "-t", str(seg_dur),
-            "-c", "copy",
+            "-c", "copy",           # stream copy — no re-encoding
             "-avoid_negative_ts", "make_zero",
             str(out_path), "-y"
         ]
+
         await st.set(
             f"✂️ *Splitting* `{name}`\n\n"
-            f"`{bar((i)/n_parts)}` part {i+1}/{n_parts}\n"
+            f"`{bar(i/n_parts)}` part {i+1}/{n_parts}\n"
             f"{spin(i)} Cutting segment {i+1}...\n"
-            f"Total: {since(t0)}"
+            f"Total: {since(t0)}\n\n"
+            f"_Send_ `stop` _to cancel_"
         )
-        log.info(f"ffmpeg part {i+1}/{n_parts}: start={start:.1f}s dur={seg_dur:.1f}s")
+        log.info(f"ffmpeg part {i+1}/{n_parts}: ss={start:.1f}s t={seg_dur:.1f}s → {out_path.name}")
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -243,19 +250,17 @@ async def ffmpeg_time_split(src: Path, out_dir: Path, n_parts: int,
             raise RuntimeError(f"ffmpeg timed out on part {i+1}")
 
         if proc.returncode != 0:
-            err = stderr.decode()[:200]
-            raise RuntimeError(f"ffmpeg part {i+1} failed: {err}")
-
+            raise RuntimeError(f"ffmpeg part {i+1} failed: {stderr.decode()[:300]}")
         if not out_path.exists() or out_path.stat().st_size == 0:
-            raise RuntimeError(f"ffmpeg produced empty file for part {i+1}")
+            raise RuntimeError(f"ffmpeg part {i+1} produced empty file")
 
         parts.append(out_path)
-        log.info(f"Part {i+1} done: {human_size(out_path.stat().st_size)}")
+        log.info(f"Part {i+1}: {human_size(out_path.stat().st_size)}")
 
     return parts
 
 
-# ── Binary split fallback (non-video files) ───────────────────────────────────
+# ── Binary split (non-video, 4 MB buffer) ─────────────────────────────────────
 
 def _binary_split_sync(src: Path, out_dir: Path,
                         chunk_bytes: int, stem: str, suffix: str) -> list:
@@ -297,17 +302,10 @@ def _binary_split_sync(src: Path, out_dir: Path,
     return parts
 
 
-# ── Master split function ──────────────────────────────────────────────────────
-
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m4v", ".wmv"}
+# ── Master split ───────────────────────────────────────────────────────────────
 
 async def do_split(src: Path, n_parts: int, st: LiveStatus,
-                   name: str, t0: float) -> tuple:
-    """
-    Returns (parts_list, out_dir).
-    For video: uses ffmpeg time-based split → playable parts.
-    For other files: binary split.
-    """
+                   name: str, t0: float, uid: int) -> tuple:
     out_dir = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix  = src.suffix.lower()
@@ -316,18 +314,20 @@ async def do_split(src: Path, n_parts: int, st: LiveStatus,
     if suffix in VIDEO_EXTS:
         duration = await get_duration(src)
         if duration and duration > 0:
-            log.info(f"Video duration: {duration:.1f}s, splitting into {n_parts} parts")
+            log.info(f"Video {duration:.1f}s → {n_parts} parts via ffmpeg MKV")
             try:
-                parts = await ffmpeg_time_split(src, out_dir, n_parts, duration, st, name, t0)
+                parts = await ffmpeg_split(src, out_dir, n_parts, duration, st, name, t0, uid)
                 return parts, out_dir
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                log.warning(f"ffmpeg split failed ({e}), falling back to binary")
+                log.warning(f"ffmpeg failed ({e}), binary fallback")
                 shutil.rmtree(out_dir, ignore_errors=True)
                 out_dir.mkdir()
         else:
-            log.warning("Could not get duration, falling back to binary split")
+            log.warning("No duration — binary split")
 
-    # Binary split for non-video or ffmpeg failure
+    # Binary split
     chunk_bytes = math.ceil(size / n_parts)
     stem        = src.stem
     done        = asyncio.Event()
@@ -341,22 +341,21 @@ async def do_split(src: Path, n_parts: int, st: LiveStatus,
             if done.is_set():
                 break
             spin_i += 1
-            written = sum(p.stat().st_size for p in out_dir.glob(f"{stem}_part*")
-                          if p.is_file())
+            written = sum(p.stat().st_size for p in out_dir.glob(f"{stem}_part*") if p.is_file())
             frac    = written / size if size > 0 else 0
             await st.set(
                 f"✂️ *Splitting* `{name}`\n\n"
                 f"`{bar(frac)}` {frac*100:.0f}%\n"
                 f"{spin(spin_i)} {human_size(written)} / {human_size(size)}\n"
-                f"Total: {since(t0)}"
+                f"Total: {since(t0)}\n\n"
+                f"_Send_ `stop` _to cancel_"
             )
 
     wt = asyncio.create_task(watcher())
     loop = asyncio.get_running_loop()
     try:
         parts = await loop.run_in_executor(
-            None,
-            lambda: _binary_split_sync(src, out_dir, chunk_bytes, stem, suffix)
+            None, lambda: _binary_split_sync(src, out_dir, chunk_bytes, stem, suffix)
         )
     finally:
         done.set()
@@ -415,66 +414,59 @@ async def do_upload(msg: Message, path: Path, display_name: str,
 
 async def process_file(msg: Message, bot, file_id: str, filename: str,
                         file_size: int, n_parts: int, t0: float,
-                        st: LiveStatus):
-    """
-    Handle one file: locate → split → upload parts.
-    For files > 2GB: binary-split into <2GB chunks first,
-    upload each chunk's parts before moving to the next chunk.
-    """
+                        st: LiveStatus, uid: int):
     parts_dir = None
     try:
         local_path = await get_local_path(bot, file_id, filename, st, file_size, t0)
 
         if not local_path.exists():
             raise RuntimeError(f"File not found: {local_path}")
+        if is_stopped(uid):
+            raise asyncio.CancelledError("Stopped by user")
 
         actual = local_path.stat().st_size
+        thresh = SPLIT_SIZE_MB * 1024 * 1024
         log.info(f"File at {local_path} — {human_size(actual)}")
 
-        # Check if file exceeds 2GB Telegram limit per file
-        if actual > MAX_TG_SIZE:
+        # ── File > 2 GB: binary super-split first ─────────────────────────────
+        if actual > MAX_TG_BYTES:
             await st.now(
-                f"⚠️ *File is {human_size(actual)}* — over Telegram's 2 GB limit\n\n"
-                f"I'll split it into <2 GB chunks first, then split each chunk "
-                f"into {SPLIT_SIZE_MB} MB parts.\n\n"
-                f"✂️ Pre-splitting large file..."
+                f"⚠️ *{human_size(actual)} file* — over Telegram's 2 GB limit\n\n"
+                f"Splitting into <2 GB chunks first, then into {SPLIT_SIZE_MB} MB parts.\n\n"
+                f"✂️ Pre-splitting..."
             )
-            # Binary split into <2GB pieces
-            chunk_bytes  = int(MAX_TG_SIZE * 0.95)   # 1.9 GB safety margin
-            n_superparts = math.ceil(actual / chunk_bytes)
-            super_dir    = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
-            super_dir.mkdir(parents=True, exist_ok=True)
-            loop         = asyncio.get_running_loop()
-            super_parts  = await loop.run_in_executor(
-                None,
-                lambda: _binary_split_sync(
+            super_chunk = int(MAX_TG_BYTES * 0.95)
+            super_dir   = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
+            super_dir.mkdir(parents=True)
+            loop        = asyncio.get_running_loop()
+            supers      = await loop.run_in_executor(
+                None, lambda: _binary_split_sync(
                     local_path, super_dir,
-                    chunk_bytes, local_path.stem, local_path.suffix
+                    super_chunk, local_path.stem, local_path.suffix
                 )
             )
-            log.info(f"Pre-split into {len(super_parts)} super-parts")
+            log.info(f"Pre-split into {len(supers)} super-parts")
 
-            for si, spart in enumerate(super_parts, 1):
+            for si, spart in enumerate(supers, 1):
+                if is_stopped(uid):
+                    raise asyncio.CancelledError("Stopped by user")
+
+                ssize  = spart.stat().st_size
+                sub_n  = max(1, math.ceil(ssize / thresh))
                 await st.now(
-                    f"📦 *Processing super-part {si}/{len(super_parts)}*\n\n"
-                    f"`{spart.name}` — {human_size(spart.stat().st_size)}\n\n"
-                    f"✂️ Splitting into {SPLIT_SIZE_MB} MB parts..."
+                    f"📦 *Chunk {si}/{len(supers)}* — {human_size(ssize)}\n\n"
+                    f"✂️ Splitting into {sub_n} parts..."
                 )
-                sub_n     = max(1, math.ceil(spart.stat().st_size / (SPLIT_SIZE_MB * 1024 * 1024)))
-                sub_parts, parts_dir = await do_split(spart, sub_n, st, spart.name, t0)
-                total_sub = len(sub_parts)
+                sub_parts, parts_dir = await do_split(spart, sub_n, st, spart.name, t0, uid)
 
                 for i, part in enumerate(sub_parts, 1):
+                    if is_stopped(uid):
+                        raise asyncio.CancelledError("Stopped by user")
                     ps     = part.stat().st_size
-                    prefix = (
-                        f"📦 Super-part {si}/{len(super_parts)} → "
-                        f"Part *{i}/{total_sub}*\n"
-                        f"{human_size(ps)}\n\n"
-                    )
+                    prefix = f"📦 Chunk {si}/{len(supers)} · Part *{i}/{len(sub_parts)}*\n{human_size(ps)}\n\n"
                     await do_upload(
                         msg, part, part.name,
-                        f"📦 *{filename}*\n"
-                        f"Chunk {si}/{len(super_parts)} — Part {i}/{total_sub} — {human_size(ps)}",
+                        f"📦 *{filename}*\nChunk {si}/{len(supers)} — Part {i}/{len(sub_parts)} — {human_size(ps)}",
                         st, prefix, t0
                     )
                     part.unlink(missing_ok=True)
@@ -485,16 +477,12 @@ async def process_file(msg: Message, bot, file_id: str, filename: str,
 
             shutil.rmtree(super_dir, ignore_errors=True)
             await st.done(
-                f"✅ *All done!*\n\n"
-                f"`{filename}`\n"
-                f"{human_size(actual)} processed\n"
-                f"⏱ Total: {since(t0)}"
+                f"✅ *All done!*\n\n`{filename}`\n"
+                f"{human_size(actual)} processed\n⏱ {since(t0)}"
             )
             return
 
-        # ── Normal file (≤ 2 GB) ─────────────────────────────────────────────
-        thresh = SPLIT_SIZE_MB * 1024 * 1024
-
+        # ── Normal file (≤ 2 GB) ──────────────────────────────────────────────
         if actual <= thresh or n_parts == 1:
             await st.now(
                 f"✅ *File ready* `{filename}`\n\n"
@@ -514,15 +502,17 @@ async def process_file(msg: Message, bot, file_id: str, filename: str,
             f"✂️ Splitting into {n_parts} parts..."
         )
 
-        parts, parts_dir = await do_split(local_path, n_parts, st, filename, t0)
-        total = len(parts)
+        parts, parts_dir = await do_split(local_path, n_parts, st, filename, t0, uid)
 
+        if is_stopped(uid):
+            raise asyncio.CancelledError("Stopped by user")
+
+        total = len(parts)
         for i, part in enumerate(parts, 1):
+            if is_stopped(uid):
+                raise asyncio.CancelledError("Stopped by user")
             ps     = part.stat().st_size
-            prefix = (
-                f"✂️ *Split done* — {total} parts\n\n"
-                f"Part *{i}/{total}* — {human_size(ps)}\n\n"
-            )
+            prefix = f"✂️ *Split done* — {total} parts\n\nPart *{i}/{total}* — {human_size(ps)}\n\n"
             await do_upload(
                 msg, part, part.name,
                 f"📦 *{filename}*\nPart {i}/{total} — {human_size(ps)}",
@@ -534,19 +524,30 @@ async def process_file(msg: Message, bot, file_id: str, filename: str,
         if parts_dir and parts_dir.exists():
             shutil.rmtree(parts_dir, ignore_errors=True)
 
+        suffix = Path(filename).suffix.lower()
+        note   = ""
+        if suffix in VIDEO_EXTS:
+            note = "\n_Parts are `.mkv` — playable in VLC, MX Player, etc._"
+
         await st.done(
-            f"✅ *All done!*\n\n"
-            f"`{filename}`\n"
+            f"✅ *All done!*\n\n`{filename}`\n"
             f"{human_size(actual)} → {total} parts\n"
-            f"⏱ Total: {since(t0)}"
+            f"⏱ Total: {since(t0)}{note}"
         )
 
+    except asyncio.CancelledError:
+        log.info(f"Job cancelled for user {uid}")
+        if parts_dir and parts_dir.exists():
+            shutil.rmtree(parts_dir, ignore_errors=True)
+        await st.done("🛑 *Stopped.*\n\nForward a file to start again.")
     except TelegramError as e:
         log.exception("Telegram error")
         await st.done(f"❌ *Telegram error*\n\n`{e}`\n\n/retry if parts were saved.")
     except Exception as e:
         log.exception("Error")
         await st.done(f"❌ *Error*\n\n`{e}`\n\n/retry if parts were saved.")
+    finally:
+        stop_flags.pop(uid, None)
 
 
 # ── Commands ───────────────────────────────────────────────────────────────────
@@ -554,13 +555,26 @@ async def process_file(msg: Message, bot, file_id: str, filename: str,
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 *File Splitter Bot*\n\n"
-        "Forward any file — I'll ask how many parts you want, then split and send.\n\n"
-        f"Default part size: *{SPLIT_SIZE_MB} MB* (set `SPLIT_SIZE_MB` in Railway vars)\n"
-        "Max per file: *2 GB* (Telegram limit)\n"
-        "Files >2 GB are handled automatically in chunks.\n\n"
+        "Forward any file — I'll ask how many parts you want.\n\n"
+        f"Default part size: *{SPLIT_SIZE_MB} MB*\n"
+        "Video parts: playable `.mkv` files\n"
+        "Max per file: *2 GB* (>2 GB handled automatically)\n\n"
+        "Send `stop` anytime to cancel.\n"
         "Commands: /status /retry /clear",
         parse_mode=ParseMode.MARKDOWN
     )
+
+async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid in stop_flags:
+        stop_flags[uid].set()
+        await update.message.reply_text("🛑 Stop signal sent — cancelling...")
+    else:
+        await update.message.reply_text("Nothing is running right now.")
+
+async def handle_stop_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Catch plain 'stop' message during any state."""
+    await cmd_stop(update, ctx)
 
 async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -588,14 +602,19 @@ async def cmd_retry(update: Update, _: ContextTypes.DEFAULT_TYPE):
     st  = LiveStatus(raw)
     await st.start(f"📤 Sending *{len(files)}* file(s)...")
     t0  = time.time()
+    uid = update.effective_user.id
+    stop_flags[uid] = asyncio.Event()
     for i, f in enumerate(files, 1):
+        if is_stopped(uid):
+            break
         await do_upload(update.message, f, f.name, f"📦 {f.name}",
                         st, f"📦 {i}/{len(files)}\n", t0)
         f.unlink(missing_ok=True)
+    stop_flags.pop(uid, None)
     for d in list(DOWNLOAD_DIR.glob("*/")):
         if d.is_dir() and not any(d.iterdir()):
             d.rmdir()
-    await st.done(f"✅ Sent {len(files)} file(s) in {since(t0)}")
+    await st.done(f"✅ Done in {since(t0)}")
 
 async def cmd_clear(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -605,7 +624,7 @@ async def cmd_clear(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Server cleared.")
 
 
-# ── File handler — ask number of parts ────────────────────────────────────────
+# ── File handler → ask parts ──────────────────────────────────────────────────
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -637,14 +656,13 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Could not detect a file.")
         return
 
-    file_size = getattr(tg_file, "file_size", 0) or 0
-    size_mb   = file_size / (1024 * 1024)
-
-    # Calculate default number of parts
+    file_size     = getattr(tg_file, "file_size", 0) or 0
+    size_mb       = file_size / (1024 * 1024)
     default_parts = max(1, math.ceil(size_mb / SPLIT_SIZE_MB))
-    part_size_mb  = size_mb / default_parts if default_parts > 0 else size_mb
+    part_size_mb  = size_mb / default_parts if default_parts else size_mb
+    suffix        = Path(filename).suffix.lower()
+    is_video      = suffix in VIDEO_EXTS
 
-    # Store job info for after user replies
     pending_jobs[user.id] = {
         "file_id":   tg_file.file_id,
         "filename":  filename,
@@ -652,25 +670,26 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "msg":       msg,
     }
 
+    video_note = "\n_Video parts will be saved as `.mkv` — fully playable_" if is_video else ""
+
     if default_parts == 1:
         await msg.reply_text(
             f"📦 *{filename}*\n"
-            f"Size: {human_size(file_size)}\n\n"
-            f"This file is under {SPLIT_SIZE_MB} MB — no split needed.\n\n"
+            f"Size: {human_size(file_size)}{video_note}\n\n"
+            f"File is under {SPLIT_SIZE_MB} MB.\n\n"
             f"Reply with:\n"
-            f"• `1` — send as-is\n"
-            f"• Any number — split into that many parts\n"
-            f"• `auto` — use default ({default_parts} part)",
+            f"• `1` or `auto` — send as-is\n"
+            f"• A number — split into that many parts",
             parse_mode=ParseMode.MARKDOWN
         )
     else:
         await msg.reply_text(
             f"📦 *{filename}*\n"
-            f"Size: {human_size(file_size)}\n\n"
-            f"How many parts do you want?\n\n"
-            f"• `auto` — default ({default_parts} parts × ~{part_size_mb:.0f} MB)\n"
-            f"• Any number — e.g. `3` splits into 3 equal parts\n\n"
-            f"_Each part must be under {SPLIT_SIZE_MB} MB_",
+            f"Size: {human_size(file_size)}{video_note}\n\n"
+            f"How many parts?\n\n"
+            f"• `auto` — {default_parts} parts × ~{part_size_mb:.0f} MB each\n"
+            f"• A number — split into exactly that many parts\n\n"
+            f"_Each part must be ≤ {SPLIT_SIZE_MB} MB. Send_ `stop` _to cancel._",
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -682,15 +701,20 @@ async def handle_parts_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.id not in pending_jobs:
         return ConversationHandler.END
 
-    job  = pending_jobs.pop(user.id)
     text = update.message.text.strip().lower()
 
-    file_size    = job["file_size"]
-    filename     = job["filename"]
-    size_mb      = file_size / (1024 * 1024)
+    # Handle stop during conversation
+    if text == "stop":
+        pending_jobs.pop(user.id, None)
+        await update.message.reply_text("🛑 Cancelled.")
+        return ConversationHandler.END
+
+    job       = pending_jobs.pop(user.id)
+    file_size = job["file_size"]
+    filename  = job["filename"]
+    size_mb   = file_size / (1024 * 1024)
     default_parts = max(1, math.ceil(size_mb / SPLIT_SIZE_MB))
 
-    # Parse user answer
     if text in ("auto", "0", ""):
         n_parts = default_parts
     else:
@@ -704,17 +728,16 @@ async def handle_parts_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pending_jobs[user.id] = job
             return ASKING_PARTS
 
-    if n_parts < 1:
-        n_parts = 1
+    n_parts = max(1, n_parts)
 
-    # Validate: each part must be ≤ SPLIT_SIZE_MB
+    # Validate part size
     if n_parts > 1:
         part_size_mb = size_mb / n_parts
         if part_size_mb > SPLIT_SIZE_MB:
             min_parts = math.ceil(size_mb / SPLIT_SIZE_MB)
             await update.message.reply_text(
-                f"⚠️ *{n_parts} parts* would make each part "
-                f"*{part_size_mb:.0f} MB* — over the {SPLIT_SIZE_MB} MB limit.\n\n"
+                f"⚠️ *{n_parts} parts* → each part ~*{part_size_mb:.0f} MB* "
+                f"(limit: {SPLIT_SIZE_MB} MB)\n\n"
                 f"Minimum parts needed: *{min_parts}*\n\n"
                 f"Reply with a number ≥ {min_parts} or `auto`.",
                 parse_mode=ParseMode.MARKDOWN
@@ -729,14 +752,16 @@ async def handle_parts_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⏬ *Processing* `{filename}`\n\n"
         f"Size: {human_size(file_size)}\n"
         f"Parts: {n_parts}\n"
-        f"Locating file on server..."
+        f"Locating file..."
     )
 
-    await process_file(
+    stop_flags[user.id] = asyncio.Event()
+
+    asyncio.create_task(process_file(
         job["msg"], ctx.bot,
         job["file_id"], filename,
-        file_size, n_parts, t0, st
-    )
+        file_size, n_parts, t0, st, user.id
+    ))
 
     return ConversationHandler.END
 
@@ -744,7 +769,9 @@ async def handle_parts_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     pending_jobs.pop(uid, None)
-    await update.message.reply_text("❌ Cancelled.")
+    if uid in stop_flags:
+        stop_flags[uid].set()
+    await update.message.reply_text("🛑 Cancelled.")
     return ConversationHandler.END
 
 
@@ -753,6 +780,9 @@ async def handle_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def catch_all(update: Update, _: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
+        return
+    # Ignore "stop" — handled elsewhere
+    if msg.text and msg.text.strip().lower() == "stop":
         return
     log.warning(
         f"UNHANDLED from {update.effective_user.id}: "
@@ -809,6 +839,7 @@ def main():
         filters.Document.ALL | filters.VIDEO
         | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
     )
+    stop_filter = filters.TEXT & filters.Regex(r"(?i)^stop$")
 
     conv = ConversationHandler(
         entry_points=[MessageHandler(file_filter, handle_file)],
@@ -817,7 +848,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_parts_answer)
             ],
         },
-        fallbacks=[CommandHandler("cancel", handle_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", handle_cancel),
+            MessageHandler(stop_filter, handle_cancel),
+        ],
         per_user=True,
         per_chat=True,
     )
@@ -827,9 +861,12 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("retry",  cmd_retry))
     app.add_handler(CommandHandler("clear",  cmd_clear))
+    app.add_handler(CommandHandler("stop",   cmd_stop))
+    app.add_handler(MessageHandler(stop_filter, handle_stop_text))
     app.add_handler(conv)
     app.add_handler(MessageHandler(
-        filters.ALL & ~filters.COMMAND & ~file_filter, catch_all
+        filters.ALL & ~filters.COMMAND & ~file_filter & ~stop_filter,
+        catch_all
     ), group=1)
 
     log.info("Bot ready.")
