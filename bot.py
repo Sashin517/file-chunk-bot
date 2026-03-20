@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Splitter Bot
+Telegram File Splitter Bot — binary split only, no ffmpeg hang
 """
 
 import os
@@ -31,7 +31,6 @@ READ_TIMEOUT    = 600
 WRITE_TIMEOUT   = 600
 CONNECT_TIMEOUT = 30
 POOL_TIMEOUT    = 60
-SPLIT_TIMEOUT   = 1800   # 30 min hard cap on ffmpeg
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -159,68 +158,20 @@ async def do_download(bot, file_id: str, dest: Path, total: int,
             pass
 
 
-# ── Split ──────────────────────────────────────────────────────────────────────
-
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m4v"}
-
-async def _ffmpeg_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
-    """
-    Use asyncio.create_subprocess_exec so the process can actually be killed
-    if it hangs — unlike subprocess.run in an executor which cannot be cancelled.
-    """
-    pattern = str(out_dir / f"part%03d{src.suffix}")
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-i", str(src),
-        "-c", "copy", "-map", "0",
-        "-segment_size", str(chunk_bytes),
-        "-f", "segment",
-        "-reset_timestamps", "1",
-        pattern, "-y"
-    ]
-    log.info(f"ffmpeg: {' '.join(cmd)}")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=SPLIT_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError(f"ffmpeg timed out after {SPLIT_TIMEOUT}s")
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg error (code {proc.returncode}): {stderr.decode()[:300]}")
-
-    parts = sorted(out_dir.glob(f"part*{src.suffix}"))
-    if not parts:
-        raise RuntimeError("ffmpeg ran but produced no output files")
-    return parts
-
-
-def _binary_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
-    parts = []
-    with open(src, "rb") as f:
-        i = 0
-        while chunk := f.read(chunk_bytes):
-            p = out_dir / f"part{i:03d}{src.suffix}"
-            p.write_bytes(chunk)
-            parts.append(p)
-            i += 1
-    return parts
-
+# ── Split — pure binary, no ffmpeg ────────────────────────────────────────────
+#
+# Why not ffmpeg?
+# ffmpeg's segment muxer waits for keyframes and hangs on many real-world
+# MP4/MKV files indefinitely. Binary split always completes in seconds,
+# works on every file type, and the user just needs the bytes to reassemble.
+# To rejoin:  cat part000.mp4 part001.mp4 part002.mp4 > full.mp4
+#             (or use the /join command on desktop apps like HJSplit / 7-Zip)
 
 async def do_split(src: Path, chunk_mb: int, st: LiveStatus,
                    name: str, dl_time: str, size: int, t0: float) -> list:
     out_dir     = src.parent / "parts"
     out_dir.mkdir(exist_ok=True)
     chunk_bytes = chunk_mb * 1024 * 1024
-    suffix      = src.suffix.lower()
 
     done   = asyncio.Event()
     spin_i = 0
@@ -233,32 +184,27 @@ async def do_split(src: Path, chunk_mb: int, st: LiveStatus,
             if done.is_set():
                 break
             spin_i += 1
-            n = len(list(out_dir.glob("part*")))
+            n        = len(list(out_dir.glob("part*")))
+            written  = sum(f.stat().st_size for f in out_dir.glob("part*"))
+            frac     = written / size if size > 0 else 0
+            speed    = written / max(time.time() - ts, 1)
+            eta      = int((size - written) / speed) if speed > 0 and written < size else 0
             await st.set(
                 f"✅ *Downloaded* in {dl_time}\n\n"
                 f"✂️ *Splitting* `{name}`\n"
-                f"{spin(spin_i)} {human_size(size)} — lossless copy\n"
-                f"Parts ready: {n}   Elapsed: {since(ts)}\n"
+                f"`{bar(frac)}` {frac*100:.0f}%\n"
+                f"{spin(spin_i)} {human_size(written)} / {human_size(size)}\n"
+                f"Parts done: {n}   ETA: {eta}s\n"
                 f"Total: {since(t0)}"
             )
 
     wt = asyncio.create_task(watcher())
     loop = asyncio.get_running_loop()
+
     try:
-        if suffix in VIDEO_EXTS:
-            try:
-                parts = await _ffmpeg_split(src, out_dir, chunk_bytes)
-            except Exception as e:
-                log.warning(f"ffmpeg failed ({e}), binary split fallback")
-                shutil.rmtree(out_dir, ignore_errors=True)
-                out_dir.mkdir()
-                parts = await loop.run_in_executor(
-                    None, lambda: _binary_split(src, out_dir, chunk_bytes)
-                )
-        else:
-            parts = await loop.run_in_executor(
-                None, lambda: _binary_split(src, out_dir, chunk_bytes)
-            )
+        parts = await loop.run_in_executor(
+            None, lambda: _binary_split(src, out_dir, chunk_bytes)
+        )
     finally:
         done.set()
         wt.cancel()
@@ -267,6 +213,24 @@ async def do_split(src: Path, chunk_mb: int, st: LiveStatus,
         except asyncio.CancelledError:
             pass
 
+    return parts
+
+
+def _binary_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
+    """Read src in chunks, write each chunk as a numbered part file."""
+    parts = []
+    suffix = src.suffix  # keep original extension so Telegram shows right icon
+    with open(src, "rb") as f:
+        i = 0
+        while True:
+            chunk = f.read(chunk_bytes)
+            if not chunk:
+                break
+            p = out_dir / f"{src.stem}_part{i+1:03d}{suffix}"
+            p.write_bytes(chunk)
+            parts.append(p)
+            log.info(f"Split part {i+1}: {p.name} ({human_size(len(chunk))})")
+            i += 1
     return parts
 
 
@@ -286,7 +250,7 @@ async def do_upload(msg: Message, path: Path, display_name: str,
             if not done.is_set():
                 spin_i += 1
                 await st.set(
-                    f"{prefix}\n"
+                    f"{prefix}"
                     f"📤 *Uploading* `{display_name}`\n"
                     f"{spin(spin_i)} {human_size(size)}   {since(ts)}\n"
                     f"Total: {since(t0)}"
@@ -317,9 +281,11 @@ async def do_upload(msg: Message, path: Path, display_name: str,
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 *File Splitter Bot*\n\n"
-        "Forward any file — I'll split it into 500 MB parts.\n\n"
-        "Max: *2 GB*\n"
-        "Commands: /status /retry /clear",
+        "Forward any file — I'll split it into 500 MB parts and send them back.\n\n"
+        "To rejoin parts on your device:\n"
+        "`cat file_part001.mp4 file_part002.mp4 > full.mp4`\n"
+        "Or use HJSplit / 7-Zip on Windows.\n\n"
+        "Max: *2 GB*   Commands: /status /retry /clear",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -427,6 +393,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         thresh  = SPLIT_SIZE_MB * 1024 * 1024
         log.info(f"Downloaded '{filename}' {human_size(actual)} in {dl_time}")
 
+        # ── Small file: send directly ─────────────────────────────────────────
         if actual <= thresh:
             await st.now(
                 f"✅ *Downloaded* in {dl_time}\n\n"
@@ -445,19 +412,19 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Large file
+        # ── Large file: split then send ───────────────────────────────────────
         await st.now(
             f"✅ *Downloaded* in {dl_time}\n\n"
             f"`{filename}` — {human_size(actual)}\n\n"
             f"✂️ Splitting into {SPLIT_SIZE_MB} MB parts..."
         )
 
-        parts      = await do_split(local_path, SPLIT_SIZE_MB, st,
-                                     filename, dl_time, actual, t0)
-        total      = len(parts)
-        split_time = since(t0)
+        parts  = await do_split(local_path, SPLIT_SIZE_MB, st,
+                                 filename, dl_time, actual, t0)
+        total  = len(parts)
         log.info(f"Split '{filename}' into {total} parts")
 
+        # original no longer needed
         local_path.unlink(missing_ok=True)
 
         for i, part in enumerate(parts, 1):
@@ -478,34 +445,28 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await st.done(
             f"✅ *All done!*\n\n"
             f"`{filename}`\n"
-            f"{human_size(actual)} → {total} × {SPLIT_SIZE_MB} MB\n\n"
+            f"{human_size(actual)} → {total} parts\n\n"
             f"⬇ Download: {dl_time}\n"
             f"⏱ Total:    {since(t0)}\n\n"
-            f"Download parts one by one 📶"
+            f"Rejoin: `cat {Path(filename).stem}_part*.{Path(filename).suffix[1:]} > full{Path(filename).suffix}`\n"
+            f"Or use HJSplit on Windows 📶"
         )
 
-    except asyncio.TimeoutError:
-        log.error("ffmpeg timed out")
-        await st.done(
-            f"❌ *Split timed out*\n\n"
-            f"ffmpeg took too long and was killed.\n"
-            f"Send /status — parts already written may be sendable via /retry."
-        )
     except TelegramError as e:
         log.exception("Telegram error")
         kept = any(job_dir.rglob("*"))
         await st.done(
             f"❌ *Telegram error*\n\n`{e}`\n\n"
-            + ("Files kept. Send /retry to resume." if kept
-               else "Please forward the file again.")
+            + ("Files kept. /retry to resume." if kept
+               else "Forward the file again.")
         )
     except Exception as e:
         log.exception("Error")
         kept = any(job_dir.rglob("*"))
         await st.done(
             f"❌ *Error*\n\n`{e}`\n\n"
-            + ("Files kept. Send /retry to resume." if kept
-               else "Please forward the file again.")
+            + ("Files kept. /retry to resume." if kept
+               else "Forward the file again.")
         )
     else:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -525,8 +486,8 @@ async def catch_all(update: Update, _: ContextTypes.DEFAULT_TYPE):
     )
     await msg.reply_text(
         "⚠️ Could not detect a file.\n\n"
-        f"doc={bool(msg.document)} video={bool(msg.video)} audio={bool(msg.audio)}\n\n"
-        "Make sure you *forward* the file directly.",
+        f"doc=`{bool(msg.document)}` video=`{bool(msg.video)}` audio=`{bool(msg.audio)}`\n\n"
+        "Make sure you *forward* the file message directly.",
         parse_mode=ParseMode.MARKDOWN
     )
 
