@@ -217,20 +217,48 @@ async def do_split(src: Path, chunk_mb: int, st: LiveStatus,
 
 
 def _binary_split(src: Path, out_dir: Path, chunk_bytes: int) -> list:
-    """Read src in chunks, write each chunk as a numbered part file."""
-    parts = []
-    suffix = src.suffix  # keep original extension so Telegram shows right icon
+    """
+    Split into chunk_bytes parts using a 4 MB read buffer.
+    Never loads more than 4 MB into RAM — safe on 1 GB Railway limit.
+    """
+    READ_BUF     = 4 * 1024 * 1024
+    parts        = []
+    suffix       = src.suffix
+    part_num     = 0
+    part_written = 0
+
     with open(src, "rb") as f:
-        i = 0
+        part_path = out_dir / f"{src.stem}_part{part_num+1:03d}{suffix}"
+        out = open(part_path, "wb")
+        parts.append(part_path)
+
         while True:
-            chunk = f.read(chunk_bytes)
-            if not chunk:
+            to_read = min(READ_BUF, chunk_bytes - part_written)
+            buf     = f.read(to_read)
+
+            if not buf:
+                out.close()
+                if part_written == 0:
+                    part_path.unlink(missing_ok=True)
+                    parts.pop()
                 break
-            p = out_dir / f"{src.stem}_part{i+1:03d}{suffix}"
-            p.write_bytes(chunk)
-            parts.append(p)
-            log.info(f"Split part {i+1}: {p.name} ({human_size(len(chunk))})")
-            i += 1
+
+            out.write(buf)
+            part_written += len(buf)
+
+            if part_written >= chunk_bytes:
+                out.close()
+                log.info(f"Split part {part_num+1}: {part_path.name} ({human_size(part_written)})")
+                part_num    += 1
+                part_written = 0
+                part_path    = out_dir / f"{src.stem}_part{part_num+1:03d}{suffix}"
+                out          = open(part_path, "wb")
+                parts.append(part_path)
+
+        if not out.closed:
+            out.close()
+            log.info(f"Split part {part_num+1}: {part_path.name} ({human_size(part_written)})")
+
     return parts
 
 
